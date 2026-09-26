@@ -1,9 +1,19 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
+  batchConfirmedCount,
+  changedStepFields,
+  closeCompletedBatches,
+  collectDownstream,
+  hasMissingSafety,
+  pruneDeletedBatchItems,
+  registerChangeBatch
+} from './batch';
+import {
   Button,
   Callout,
   Card,
   Checkbox,
+  Dialog,
   Divider,
   Elevation,
   FormGroup,
@@ -30,7 +40,28 @@ interface ReviewComment {
   resolved: boolean;
 }
 
-interface ProcessStep {
+export interface ReviewBatchItem {
+  stepId: string;
+  title: string;
+  confirmed: boolean;
+  downstream: boolean;
+}
+
+export interface ReviewBatch {
+  id: string;
+  code: string;
+  sourceStepId: string;
+  sourceTitle: string;
+  deleted: boolean;
+  changedFields: string[];
+  items: ReviewBatchItem[];
+  createdAt: string;
+  updatedAt: string;
+  closed: boolean;
+  closedAt?: string;
+}
+
+export interface ProcessStep {
   id: string;
   title: string;
   purpose: string;
@@ -57,7 +88,7 @@ interface VersionSnapshot {
   steps: ProcessStep[];
 }
 
-interface ExperimentProcess {
+export interface ExperimentProcess {
   id: string;
   title: string;
   code: string;
@@ -67,6 +98,8 @@ interface ExperimentProcess {
   status: ProcessStatus;
   version: string;
   steps: ProcessStep[];
+  batches: ReviewBatch[];
+  batchSeq: number;
   versions: VersionSnapshot[];
   frozenAt?: string;
   updatedAt: string;
@@ -83,6 +116,7 @@ interface DiffItem {
   title: string;
   kind: 'added' | 'removed' | 'changed';
   detail: string;
+  impactedBy?: string[];
 }
 
 const STORAGE_KEY = 'sologsb-1027-lab-safety-v1';
@@ -160,7 +194,7 @@ function initialProcess(): ExperimentProcess {
     objective: '在受控温度下评价催化剂活性，并完整记录过程样品与安全控制措施。',
     principal: '李明', lab: '材料化学实验室 B-207',
     status: 'in-review', version: '1.2.0-draft',
-    steps: baseSteps, versions: [firstVersion, secondVersion], updatedAt: new Date().toISOString()
+    steps: baseSteps, batches: [], batchSeq: 0, versions: [firstVersion, secondVersion], updatedAt: new Date().toISOString()
   };
 }
 
@@ -193,8 +227,15 @@ function loadProcess(): ExperimentProcess {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
     if (!value) return initialProcess();
-    const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    const parsed = JSON.parse(value) as Partial<ExperimentProcess>;
+    if (!parsed.id || !Array.isArray(parsed.steps)) return initialProcess();
+    return {
+      ...initialProcess(),
+      ...parsed,
+      batches: Array.isArray(parsed.batches) ? parsed.batches : [],
+      batchSeq: typeof parsed.batchSeq === 'number' ? parsed.batchSeq : 0,
+      versions: Array.isArray(parsed.versions) ? parsed.versions : []
+    } as ExperimentProcess;
   } catch {
     return initialProcess();
   }
@@ -230,16 +271,36 @@ function App() {
   const [online, setOnline] = useState(true);
   const [compareBaseId, setCompareBaseId] = useState(process.versions[0]?.id ?? '');
   const [compareTargetId, setCompareTargetId] = useState(process.versions.at(-1)?.id ?? '');
+  const [freezeBlockers, setFreezeBlockers] = useState<string[]>([]);
+  const [freezeDialogOpen, setFreezeDialogOpen] = useState(false);
   const initialSaveSkipped = useRef(false);
 
   const selectedStep = process.steps.find((step) => step.id === selectedStepId) ?? process.steps[0];
   const downstreamIds = useMemo(() => collectDownstream(process.steps, lastModifiedId), [process.steps, lastModifiedId]);
   const impactedSteps = process.steps.filter((step) => downstreamIds.includes(step.id));
   const missingSafetySteps = process.steps.filter(hasMissingSafety);
-  const pendingReviewCount = process.steps.filter((step) => step.status === 'submitted' || step.status === 'returned').length;
+  const frozen = process.status === 'frozen';
+  const openBatches = useMemo(() => process.batches.filter((batch) => !batch.closed), [process.batches]);
+  const pendingBatchItems = useMemo(() => {
+    const ids = new Set<string>();
+    openBatches.forEach((batch) => batch.items.forEach((item) => { if (!item.confirmed) ids.add(item.stepId); }));
+    return ids;
+  }, [openBatches]);
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
+
+  const collectFreezeBlockers = (): string[] => {
+    const blockers: string[] = [];
+    if (openBatches.length) {
+      const remaining = openBatches.reduce((sum, batch) => sum + batch.items.filter((item) => !item.confirmed).length, 0);
+      blockers.push(`存在 ${openBatches.length} 个未处理复核批次（${remaining} 项待逐项确认）：${openBatches.map((batch) => batch.code).join('、')}。`);
+    }
+    const unconfirmed = process.steps.filter((step) => step.status !== 'confirmed');
+    if (unconfirmed.length) blockers.push(`${unconfirmed.length} 个步骤尚未确认：${unconfirmed.map((step) => step.title).join('、')}。`);
+    if (missingSafetySteps.length) blockers.push(`${missingSafetySteps.length} 个步骤存在安全信息缺口：${missingSafetySteps.map((step) => step.title).join('、')}。`);
+    return blockers;
+  };
 
   useEffect(() => {
     if (!initialSaveSkipped.current) {
@@ -290,12 +351,16 @@ function App() {
   };
 
   const updateStep = (field: keyof ProcessStep, value: unknown): void => {
-    if (!selectedStep) return;
+    if (!selectedStep || process.status === 'frozen') return;
     const id = selectedStep.id;
+    const before = clone(selectedStep);
     setLastModifiedId(id);
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      if (step) (step as unknown as Record<string, unknown>)[field] = value;
+      if (!step) return;
+      (step as unknown as Record<string, unknown>)[field] = value;
+      const fields = changedStepFields(before, step);
+      if (fields.length) registerChangeBatch(draft, id, fields, false, () => uid('batch'));
     });
   };
 
@@ -338,10 +403,14 @@ function App() {
     if (!selectedStep || process.steps.length <= 1 || process.status === 'frozen') return;
     const id = selectedStep.id;
     commitProcess((draft) => {
+      registerChangeBatch(draft, id, ['步骤删除'], true, () => uid('batch'));
       draft.steps = draft.steps.filter((step) => step.id !== id);
       draft.steps.forEach((step) => { step.dependencies = step.dependencies.filter((dependency) => dependency !== id); });
+      pruneDeletedBatchItems(draft, id);
     });
     setSelectedStepId(process.steps.find((step) => step.id !== id)?.id ?? '');
+    setLastModifiedId(id);
+    setActiveView('review');
   };
 
   const moveStep = (direction: -1 | 1): void => {
@@ -392,8 +461,53 @@ function App() {
 
   const setStepStatus = (status: StepStatus): void => {
     if (!selectedStep) return;
-    updateStep('status', status);
-    setLastModifiedId(status === 'returned' ? selectedStep.id : null);
+    const id = selectedStep.id;
+    commitProcess((draft) => {
+      const step = draft.steps.find((item) => item.id === id);
+      if (step) step.status = status;
+      const now = new Date().toISOString();
+      draft.batches.forEach((batch) => {
+        if (batch.closed) return;
+        const item = batch.items.find((entry) => entry.stepId === id);
+        if (!item) return;
+        if (status === 'confirmed') {
+          item.confirmed = true;
+        } else if (status === 'returned') {
+          item.confirmed = false;
+        }
+        batch.updatedAt = now;
+      });
+      closeCompletedBatches(draft);
+    });
+    setLastModifiedId(status === 'returned' ? id : null);
+  };
+
+  const confirmBatchItem = (batchId: string, stepId: string): void => {
+    commitProcess((draft) => {
+      const batch = draft.batches.find((item) => item.id === batchId);
+      if (!batch || batch.closed) return;
+      const entry = batch.items.find((item) => item.stepId === stepId);
+      const step = draft.steps.find((item) => item.id === stepId);
+      if (!entry || entry.confirmed || !step || hasMissingSafety(step)) return;
+      entry.confirmed = true;
+      step.status = 'confirmed';
+      batch.updatedAt = new Date().toISOString();
+      closeCompletedBatches(draft);
+    });
+  };
+
+  const returnBatchItem = (batchId: string, stepId: string): void => {
+    commitProcess((draft) => {
+      const batch = draft.batches.find((item) => item.id === batchId);
+      if (!batch || batch.closed) return;
+      const entry = batch.items.find((item) => item.stepId === stepId);
+      const step = draft.steps.find((item) => item.id === stepId);
+      if (!entry || !step) return;
+      entry.confirmed = false;
+      step.status = 'returned';
+      batch.updatedAt = new Date().toISOString();
+    });
+    setLastModifiedId(stepId);
   };
 
   const resolveComment = (commentId: string): void => {
@@ -407,8 +521,11 @@ function App() {
 
   const freezeVersion = (): void => {
     if (process.status === 'frozen') return;
-    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length) {
-      setSavedLabel('冻结条件未满足');
+    const blockers = collectFreezeBlockers();
+    if (blockers.length) {
+      setFreezeBlockers(blockers);
+      setFreezeDialogOpen(true);
+      setSavedLabel('冻结被未处理批次或未确认步骤阻止');
       return;
     }
     const nextNumber = nextMinorVersion(process.version);
@@ -417,7 +534,7 @@ function App() {
     commitProcess((draft) => {
       draft.versions.push({
         id: frozenVersionId, label: '复核通过冻结版', version: nextNumber,
-        createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整。`,
+        createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，${draft.batches.filter((batch) => batch.closed).length} 个复核批次全部结案，安全控制完整。`,
         author: CURRENT_AUTHOR, steps: clone(draft.steps)
       });
       draft.version = nextNumber;
@@ -427,6 +544,7 @@ function App() {
     setSavedLabel(`版本 ${nextNumber} 已冻结`);
     setCompareBaseId(previousVersionId);
     setCompareTargetId(frozenVersionId);
+    setFreezeDialogOpen(false);
   };
 
   const startRevision = (): void => {
@@ -438,7 +556,13 @@ function App() {
       draft.frozenAt = undefined;
       draft.steps.forEach((step) => {
         step.status = 'draft';
-        step.comments = [];
+      });
+      // 修订稿开启新一轮复核，既有批次留档备查，不再作为待办拦截冻结。
+      draft.batches.forEach((batch) => {
+        if (!batch.closed) {
+          batch.closed = true;
+          batch.closedAt = new Date().toISOString();
+        }
       });
     });
     setActiveView('editor');
@@ -472,7 +596,7 @@ function App() {
           <Button icon="undo" text="撤销" minimal disabled={history.past.length === 0} onClick={() => dispatch({ type: 'undo' })} />
           <Button icon="redo" text="重做" minimal disabled={history.future.length === 0} onClick={() => dispatch({ type: 'redo' })} />
           <Button icon="floppy-disk" text="保存快照" onClick={addVersionSnapshot} />
-          <Button icon="lock" text="冻结版本" intent="primary" onClick={freezeVersion} disabled={process.status === 'frozen'} />
+          <Button icon="lock" text="冻结版本" intent="primary" onClick={freezeVersion} disabled={frozen} />
         </div>
       </header>
 
@@ -492,13 +616,13 @@ function App() {
         <div className="banner-progress">
           <div><span>复核进度</span><strong>{confirmedCount}/{process.steps.length}</strong></div>
           <ProgressBar value={reviewProgress / 100} intent={reviewProgress === 100 ? 'success' : 'primary'} stripes={reviewProgress < 100} />
-          <small>{pendingReviewCount ? `${pendingReviewCount} 条待处理` : '所有步骤已处理'} · {missingSafetySteps.length} 条安全缺口</small>
+          <small>{openBatches.length ? `${openBatches.length} 个待复核批次 · ${pendingBatchItems.size} 项待确认` : '没有待处理批次'} · {missingSafetySteps.length} 条安全缺口</small>
         </div>
       </section>
 
       <Tabs id="workspace-tabs" selectedTabId={activeView} onChange={(value) => setActiveView(value as ViewId)} renderActiveTabPanelOnly className="workspace-tabs">
         <Tab id="editor" title={<span><Icon icon="edit" /> 流程编写</span>} />
-        <Tab id="review" title={<span><Icon icon="endorsed" /> 安全复核 {pendingReviewCount > 0 && <b className="tab-badge">{pendingReviewCount}</b>}</span>} />
+        <Tab id="review" title={<span><Icon icon="endorsed" /> 安全复核 {openBatches.length > 0 && <b className="tab-badge">{openBatches.length}</b>}</span>} />
         <Tab id="compare" title={<span><Icon icon="comparison" /> 版本比较</span>} />
       </Tabs>
 
@@ -513,8 +637,12 @@ function App() {
               {process.steps.map((step, index) => (
                 <button key={step.id} className={step.id === selectedStep.id ? 'selected' : ''} onClick={() => setSelectedStepId(step.id)}>
                   <span className={`step-number ${step.status}`}>{String(index + 1).padStart(2, '0')}</span>
-                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}</small></span>
-                  {hasMissingSafety(step) && <Icon icon="warning-sign" intent="danger" size={13} />}
+                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}{pendingBatchItems.has(step.id) ? ' · 待复核' : ''}</small></span>
+                  {pendingBatchItems.has(step.id)
+                    ? <Icon icon="notifications" intent="warning" size={13} />
+                    : hasMissingSafety(step)
+                      ? <Icon icon="warning-sign" intent="danger" size={13} />
+                      : <span className="step-list-placeholder" />}
                 </button>
               ))}
             </div>
@@ -530,12 +658,12 @@ function App() {
             <Card elevation={Elevation.ONE} className="process-meta-card">
               <div className="card-title"><div><span>PROCESS INFO</span><h3>实验基本信息</h3></div><Tag minimal intent="primary">{process.steps.length} 个步骤</Tag></div>
               <div className="meta-grid">
-                <FormGroup label="实验名称" labelFor="process-title"><InputGroup id="process-title" fill value={process.title} onChange={(event) => updateProcessField('title', event.target.value)} /></FormGroup>
-                <FormGroup label="流程编号" labelFor="process-code"><InputGroup id="process-code" fill value={process.code} onChange={(event) => updateProcessField('code', event.target.value)} /></FormGroup>
-                <FormGroup label="负责人" labelFor="principal"><InputGroup id="principal" fill value={process.principal} onChange={(event) => updateProcessField('principal', event.target.value)} /></FormGroup>
-                <FormGroup label="实验区域" labelFor="lab"><InputGroup id="lab" fill value={process.lab} onChange={(event) => updateProcessField('lab', event.target.value)} /></FormGroup>
+                <FormGroup label="实验名称" labelFor="process-title"><InputGroup id="process-title" fill disabled={frozen} value={process.title} onChange={(event) => updateProcessField('title', event.target.value)} /></FormGroup>
+                <FormGroup label="流程编号" labelFor="process-code"><InputGroup id="process-code" fill disabled={frozen} value={process.code} onChange={(event) => updateProcessField('code', event.target.value)} /></FormGroup>
+                <FormGroup label="负责人" labelFor="principal"><InputGroup id="principal" fill disabled={frozen} value={process.principal} onChange={(event) => updateProcessField('principal', event.target.value)} /></FormGroup>
+                <FormGroup label="实验区域" labelFor="lab"><InputGroup id="lab" fill disabled={frozen} value={process.lab} onChange={(event) => updateProcessField('lab', event.target.value)} /></FormGroup>
               </div>
-              <FormGroup label="实验目标" labelFor="objective"><TextArea id="objective" fill value={process.objective} onChange={(event) => updateProcessField('objective', event.target.value)} /></FormGroup>
+              <FormGroup label="实验目标" labelFor="objective"><TextArea id="objective" fill disabled={frozen} value={process.objective} onChange={(event) => updateProcessField('objective', event.target.value)} /></FormGroup>
             </Card>
 
             <Card elevation={Elevation.ONE} className="step-editor-card">
@@ -543,22 +671,22 @@ function App() {
                 <div><span>STEP {String(process.steps.indexOf(selectedStep) + 1).padStart(2, '0')}</span><h3>{selectedStep.title}</h3></div>
                 <Tag minimal intent={selectedStep.status === 'confirmed' ? 'success' : selectedStep.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(selectedStep.status)}</Tag>
               </div>
-              <FormGroup label="步骤名称" labelFor="step-title"><InputGroup id="step-title" fill value={selectedStep.title} onChange={(event) => updateStep('title', event.target.value)} /></FormGroup>
-              <FormGroup label="操作目的" labelFor="step-purpose"><TextArea id="step-purpose" fill value={selectedStep.purpose} onChange={(event) => updateStep('purpose', event.target.value)} /></FormGroup>
+              <FormGroup label="步骤名称" labelFor="step-title"><InputGroup id="step-title" fill disabled={frozen} value={selectedStep.title} onChange={(event) => updateStep('title', event.target.value)} /></FormGroup>
+              <FormGroup label="操作目的" labelFor="step-purpose"><TextArea id="step-purpose" fill disabled={frozen} value={selectedStep.purpose} onChange={(event) => updateStep('purpose', event.target.value)} /></FormGroup>
               <div className="form-grid">
-                <FormGroup label="材料" labelFor="materials"><TextArea id="materials" fill value={selectedStep.materials} onChange={(event) => updateStep('materials', event.target.value)} /></FormGroup>
-                <FormGroup label="设备" labelFor="equipment"><TextArea id="equipment" fill value={selectedStep.equipment} onChange={(event) => updateStep('equipment', event.target.value)} /></FormGroup>
-                <FormGroup label="用量 / 参数" labelFor="amount"><TextArea id="amount" fill value={selectedStep.amount} onChange={(event) => updateStep('amount', event.target.value)} /></FormGroup>
-                <FormGroup label="预计时间（分钟）" labelFor="duration"><InputGroup id="duration" type="number" min={1} fill value={String(selectedStep.duration)} onChange={(event) => updateStep('duration', Number(event.target.value))} /></FormGroup>
+                <FormGroup label="材料" labelFor="materials"><TextArea id="materials" fill disabled={frozen} value={selectedStep.materials} onChange={(event) => updateStep('materials', event.target.value)} /></FormGroup>
+                <FormGroup label="设备" labelFor="equipment"><TextArea id="equipment" fill disabled={frozen} value={selectedStep.equipment} onChange={(event) => updateStep('equipment', event.target.value)} /></FormGroup>
+                <FormGroup label="用量 / 参数" labelFor="amount"><TextArea id="amount" fill disabled={frozen} value={selectedStep.amount} onChange={(event) => updateStep('amount', event.target.value)} /></FormGroup>
+                <FormGroup label="预计时间（分钟）" labelFor="duration"><InputGroup id="duration" type="number" min={1} fill disabled={frozen} value={String(selectedStep.duration)} onChange={(event) => updateStep('duration', Number(event.target.value))} /></FormGroup>
               </div>
               <div className="form-grid two-column">
-                <FormGroup label="危险项（逗号或换行分隔）" labelFor="hazards"><TextArea id="hazards" fill value={selectedStep.hazards.join('，')} onChange={(event) => updateStepList('hazards', event.target.value)} /></FormGroup>
-                <FormGroup label="控制措施" labelFor="controls"><TextArea id="controls" fill value={selectedStep.controls} onChange={(event) => updateStep('controls', event.target.value)} /></FormGroup>
+                <FormGroup label="危险项（逗号或换行分隔）" labelFor="hazards"><TextArea id="hazards" fill disabled={frozen} value={selectedStep.hazards.join('，')} onChange={(event) => updateStepList('hazards', event.target.value)} /></FormGroup>
+                <FormGroup label="控制措施" labelFor="controls"><TextArea id="controls" fill disabled={frozen} value={selectedStep.controls} onChange={(event) => updateStep('controls', event.target.value)} /></FormGroup>
               </div>
               <FormGroup label="安全说明" labelFor="safety-note" helperText={hasMissingSafety(selectedStep) ? '存在危险项时，控制措施和安全说明均为必填。' : '安全说明已满足复核条件。'}>
-                <TextArea id="safety-note" fill intent={hasMissingSafety(selectedStep) ? 'danger' : 'none'} value={selectedStep.safetyNote} onChange={(event) => updateStep('safetyNote', event.target.value)} />
+                <TextArea id="safety-note" fill disabled={frozen} intent={hasMissingSafety(selectedStep) ? 'danger' : 'none'} value={selectedStep.safetyNote} onChange={(event) => updateStep('safetyNote', event.target.value)} />
               </FormGroup>
-              <FormGroup label="预期结果" labelFor="expected"><TextArea id="expected" fill value={selectedStep.expectedResult} onChange={(event) => updateStep('expectedResult', event.target.value)} /></FormGroup>
+              <FormGroup label="预期结果" labelFor="expected"><TextArea id="expected" fill disabled={frozen} value={selectedStep.expectedResult} onChange={(event) => updateStep('expectedResult', event.target.value)} /></FormGroup>
             </Card>
 
             <Card elevation={Elevation.ONE} className="dependency-card">
@@ -574,24 +702,35 @@ function App() {
 
           <aside className="inspector-panel">
             <Card elevation={Elevation.ONE} className="impact-card">
-              <div className="card-title"><div><span>IMPACT ANALYSIS</span><h3>变更影响提醒</h3></div><Icon icon="path-search" size={18} /></div>
-              {lastModifiedId ? (
+              <div className="card-title"><div><span>IMPACT ANALYSIS</span><h3>变更影响提醒</h3></div><Tag minimal intent={openBatches.length ? 'warning' : 'none'}>{openBatches.length ? `${openBatches.length} 个待复核批次` : '无待处理批次'}</Tag></div>
+              {openBatches.length ? (
                 <>
-                  <Callout intent={impactedSteps.length ? 'warning' : 'primary'} icon={impactedSteps.length ? 'warning-sign' : 'tick'}>
-                    <strong>{impactedSteps.length ? `${impactedSteps.length} 个后续步骤受影响` : '未发现下游步骤'}</strong>
-                    <p>{impactedSteps.length ? '请重新核对依赖、用量、危险项和已确认内容。' : '当前修改没有影响其他步骤的安全条件。'}</p>
+                  <Callout intent="warning" icon="warning-sign">
+                    <strong>改动已退回待复核，不能直接冻结</strong>
+                    <p>每次改动生成一个待复核批次，改动步骤及其全部下游步骤需由复核员逐项确认，批次才会结案。</p>
                   </Callout>
                   <div className="impact-list">
-                    {impactedSteps.map((step) => (
-                      <button key={step.id} onClick={() => setSelectedStepId(step.id)}>
-                        <Icon icon={step.status === 'confirmed' ? 'endorsed' : 'circle'} intent={step.status === 'confirmed' ? 'success' : 'none'} size={13} />
-                        <span><strong>{step.title}</strong><small>{step.status === 'confirmed' ? '已确认内容，需重新复核' : `当前状态：${statusLabel(step.status)}`}</small></span>
-                        <Icon icon="chevron-right" size={12} />
-                      </button>
-                    ))}
+                    {openBatches.flatMap((batch) => batch.items.filter((item) => !item.confirmed).map((item) => {
+                      const step = process.steps.find((entry) => entry.id === item.stepId);
+                      const missing = step ? hasMissingSafety(step) : false;
+                      return (
+                        <button key={`${batch.id}-${item.stepId}`} onClick={() => { setSelectedStepId(item.stepId); setActiveView('review'); }}>
+                          <Icon icon={missing ? 'warning-sign' : item.downstream ? 'graph' : 'edit'} intent={missing ? 'danger' : item.downstream ? 'warning' : 'primary'} size={13} />
+                          <span><strong>{step?.title ?? item.title}</strong><small>{batch.code} · {missing ? '存在安全缺口 · ' : ''}{item.downstream ? `受「${batch.sourceTitle}」改动影响的下游步骤` : `改动：${batch.changedFields.join('、')}`}</small></span>
+                          <Icon icon="chevron-right" size={12} />
+                        </button>
+                      );
+                    }))}
                   </div>
                 </>
-              ) : <p className="muted">编辑任一步骤后，这里会显示受影响的所有后续步骤和已确认内容。</p>}
+              ) : (
+                <>
+                  <Callout intent="primary" icon="tick">
+                    <strong>当前没有待处理复核批次</strong>
+                    <p>{impactedSteps.length ? `最近编辑涉及 ${impactedSteps.length} 个下游步骤，相关批次已全部结案。` : '编辑任一步骤后，系统会自动计算受影响的全部下游步骤。'}</p>
+                  </Callout>
+                </>
+              )}
             </Card>
 
             <Card elevation={Elevation.ONE} className="safety-card">
@@ -604,6 +743,7 @@ function App() {
             <Card elevation={Elevation.ONE} className="gate-card">
               <div className="card-title"><div><span>RELEASE GATE</span><h3>提交与冻结</h3></div></div>
               <div className="gate-row"><span>复核状态</span><strong>{confirmedCount}/{process.steps.length}</strong></div>
+              <div className="gate-row"><span>待复核批次</span><strong className={openBatches.length ? 'danger-text' : ''}>{openBatches.length}</strong></div>
               <div className="gate-row"><span>安全缺口</span><strong className={missingSafetySteps.length ? 'danger-text' : ''}>{missingSafetySteps.length}</strong></div>
               <div className="gate-row"><span>流程状态</span><strong>{processStatusLabel(process.status)}</strong></div>
               <Divider />
@@ -616,10 +756,10 @@ function App() {
       {activeView === 'review' && (
         <main className="review-layout">
           <aside className="review-steps">
-            <div className="panel-heading"><div><span>REVIEW QUEUE</span><h3>逐条复核</h3></div><Tag intent={pendingReviewCount ? 'warning' : 'success'}>{pendingReviewCount ? `${pendingReviewCount} 待处理` : '已完成'}</Tag></div>
+            <div className="panel-heading"><div><span>REVIEW QUEUE</span><h3>逐条复核</h3></div><Tag intent={openBatches.length ? 'warning' : 'success'}>{openBatches.length ? `${openBatches.length} 个批次待处理` : '已完成'}</Tag></div>
             {process.steps.map((step, index) => (
-              <button key={step.id} className={`${step.id === selectedStep.id ? 'selected' : ''} ${step.status}`} onClick={() => setSelectedStepId(step.id)}>
-                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} size={15} />
+              <button key={step.id} className={`${step.id === selectedStep?.id ? 'selected' : ''} ${step.status}`} onClick={() => setSelectedStepId(step.id)}>
+                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}{pendingBatchItems.has(step.id) ? ' · 批次待确认' : ''}</small></div><Icon icon={pendingBatchItems.has(step.id) ? 'notifications' : step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} intent={pendingBatchItems.has(step.id) ? 'warning' : 'none'} size={15} />
               </button>
             ))}
           </aside>
@@ -653,21 +793,81 @@ function App() {
                     {!selectedStep.comments.length && <p className="muted">当前步骤尚未添加复核批注。</p>}
                   </div>
                 </Card>
+
+                <Card elevation={Elevation.ONE} className="batch-card">
+                  <div className="card-title"><div><span>REVIEW BATCHES</span><h3>待复核批次</h3></div><Tag minimal intent={openBatches.length ? 'warning' : 'success'}>{openBatches.length ? `${openBatches.length} 个进行中` : '全部结案'}</Tag></div>
+                  {openBatches.length ? (
+                    <div className="batch-list">
+                      {openBatches.map((batch) => {
+                        const done = batchConfirmedCount(batch);
+                        return (
+                          <article key={batch.id} className="batch-item">
+                            <header>
+                              <div><b>{batch.code}</b><strong>{batch.deleted ? `删除步骤：${batch.sourceTitle}` : `改动步骤：${batch.sourceTitle}`}</strong></div>
+                              <Tag minimal intent={done === batch.items.length ? 'success' : 'warning'}>{done}/{batch.items.length}</Tag>
+                            </header>
+                            <p className="batch-meta">{formatDate(batch.createdAt)} 发起 · 变化内容：{batch.changedFields.join('、')}</p>
+                            <div className="batch-items">
+                              {batch.items.map((item) => {
+                                const step = process.steps.find((entry) => entry.id === item.stepId);
+                                const missing = step ? hasMissingSafety(step) : false;
+                                return (
+                                  <div key={item.stepId} className={item.confirmed ? 'confirmed' : ''}>
+                                    <button className="batch-step-link" onClick={() => setSelectedStepId(item.stepId)}>
+                                      <Icon icon={item.confirmed ? 'tick-circle' : item.downstream ? 'graph' : 'edit'} intent={item.confirmed ? 'success' : item.downstream ? 'warning' : 'primary'} size={14} />
+                                      <span><strong>{step?.title ?? item.title}</strong><small>{item.downstream ? '受影响下游步骤' : '本次改动步骤'}{missing ? ' · 安全缺口' : ''}</small></span>
+                                    </button>
+                                    {!item.confirmed && (
+                                      <div className="batch-item-actions">
+                                        <Button small minimal intent="success" icon="tick" text="确认" disabled={!step || missing} onClick={() => confirmBatchItem(batch.id, item.stepId)} />
+                                        <Button small minimal intent="warning" icon="undo" text="退回" disabled={!step} onClick={() => returnBatchItem(batch.id, item.stepId)} />
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            {done === batch.items.length && <p className="batch-done">全部逐项确认，批次已结案。</p>}
+                          </article>
+                        );
+                      })}
+                    </div>
+                  ) : <p className="muted">没有未处理的复核批次。研究员改动已确认步骤后，改动步骤与全部下游步骤会自动退回这里等待逐项确认。</p>}
+                </Card>
+
+                <Card elevation={Elevation.ONE} className="batch-history-card">
+                  <div className="card-title"><div><span>BATCH HISTORY</span><h3>批次历史</h3></div><Tag minimal>{process.batches.filter((batch) => batch.closed).length} 个已结案</Tag></div>
+                  {process.batches.filter((batch) => batch.closed).length ? (
+                    <div className="batch-history">
+                      {process.batches.filter((batch) => batch.closed).map((batch) => (
+                        <div key={batch.id}>
+                          <Icon icon="box" size={13} />
+                          <span><strong>{batch.code} · {batch.sourceTitle}</strong><small>{batch.changedFields.join('、')} · {batch.items.length} 项全部确认{batch.closedAt ? ` · ${formatDate(batch.closedAt)} 结案` : ''}</small></span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : <p className="muted">尚无已结案批次。</p>}
+                </Card>
               </>
             )}
           </section>
           <aside className="review-actions">
             <Card elevation={Elevation.ONE}>
               <div className="card-title"><div><span>REVIEWER ACTION</span><h3>复核决定</h3></div><Icon icon="endorsed" size={18} /></div>
-              <p className="muted">确认后若修改该步骤，受影响的下游步骤会在编辑页重新提示。</p>
-              <Button fill large intent="success" icon="tick" text="逐条确认" disabled={hasMissingSafety(selectedStep)} onClick={() => setStepStatus('confirmed')} />
-              <Button fill large icon="undo" text="退回修改" intent="warning" onClick={() => setStepStatus('returned')} />
-              <Button fill large minimal icon="refresh" text="恢复为待复核" onClick={() => setStepStatus('submitted')} />
+              {selectedStep && pendingBatchItems.has(selectedStep.id) && (
+                <Callout intent="warning" icon="notifications" className="reviewer-batch-callout">
+                  该步骤存在于未结复核批次中，请在下方“待复核批次”中逐项确认；全部确认后批次才结案。
+                </Callout>
+              )}
+              <p className="muted">确认后研究员若再次改动同一步骤或其上游，该步骤会随新批次重新退回待复核，旧确认不再有效。</p>
+              <Button fill large intent="success" icon="tick" text="确认当前步骤" disabled={!selectedStep || hasMissingSafety(selectedStep) || frozen || (selectedStep?.status === 'confirmed' && !pendingBatchItems.has(selectedStep.id))} onClick={() => selectedStep && setStepStatus('confirmed')} />
+              <Button fill large icon="undo" text="退回修改" intent="warning" disabled={!selectedStep || frozen} onClick={() => setStepStatus('returned')} />
+              <Button fill large minimal icon="refresh" text="恢复为待复核" disabled={!selectedStep || frozen} onClick={() => setStepStatus('submitted')} />
               <Divider />
               <div className="review-progress-list">
-                {process.steps.map((step) => <div key={step.id}><span>{step.title}</span><Tag minimal intent={step.status === 'confirmed' ? 'success' : step.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(step.status)}</Tag></div>)}
+                {process.steps.map((step) => <div key={step.id}><span>{step.title}</span><Tag minimal intent={pendingBatchItems.has(step.id) ? 'warning' : step.status === 'confirmed' ? 'success' : step.status === 'returned' ? 'danger' : 'none'}>{pendingBatchItems.has(step.id) ? '批次待确认' : statusLabel(step.status)}</Tag></div>)}
               </div>
-              <Button fill intent="primary" icon="lock" text="全部确认后冻结" onClick={freezeVersion} disabled={process.status === 'frozen'} />
+              <Button fill intent="primary" icon="lock" text="全部确认后冻结" onClick={freezeVersion} disabled={frozen} />
             </Card>
           </aside>
         </main>
@@ -699,13 +899,32 @@ function App() {
           </Card>
           <Card elevation={Elevation.ONE} className="freeze-rules">
             <div className="card-title"><div><span>FREEZE RULES</span><h3>冻结检查</h3></div></div>
+            <div className={openBatches.length === 0 ? 'passed' : ''}><Icon icon={openBatches.length === 0 ? 'tick-circle' : 'circle'} /><span><strong>待复核批次全部结案</strong><small>{openBatches.length} 个未处理批次 · {pendingBatchItems.size} 项待确认</small></span></div>
             <div className={confirmedCount === process.steps.length ? 'passed' : ''}><Icon icon={confirmedCount === process.steps.length ? 'tick-circle' : 'circle'} /><span><strong>所有步骤已确认</strong><small>{confirmedCount}/{process.steps.length}</small></span></div>
             <div className={!missingSafetySteps.length ? 'passed' : ''}><Icon icon={!missingSafetySteps.length ? 'tick-circle' : 'circle'} /><span><strong>安全信息完整</strong><small>{missingSafetySteps.length} 个缺口</small></span></div>
             <div className={process.steps.every((step) => step.dependencies.every((id) => process.steps.some((item) => item.id === id))) ? 'passed' : ''}><Icon icon="git-merge" /><span><strong>依赖引用有效</strong><small>{process.steps.reduce((sum, step) => sum + step.dependencies.length, 0)} 条依赖</small></span></div>
-            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0} />
+            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={frozen} />
           </Card>
         </main>
       )}
+
+      <Dialog isOpen={freezeDialogOpen} onClose={() => setFreezeDialogOpen(false)} title="暂时无法冻结版本" icon="lock" className="freeze-dialog">
+        <div className="freeze-dialog-body">
+          <Callout intent="danger" icon="warning-sign">
+            以下复核事项尚未处理完毕，全部解决后才能冻结版本。
+          </Callout>
+          <ul className="freeze-blocker-list">
+            {freezeBlockers.map((blocker) => (
+              <li key={blocker}><Icon icon="small-cross" intent="danger" size={14} /><span>{blocker}</span></li>
+            ))}
+          </ul>
+          <p className="muted">研究员的每次改动都会生成待复核批次，改动步骤和全部下游步骤需复核员逐项确认，批次结案后该门禁才会通过。</p>
+        </div>
+        <div className="freeze-dialog-footer">
+          <Button text="关闭" onClick={() => setFreezeDialogOpen(false)} />
+          <Button intent="primary" icon="endorsed" text="前往复核" onClick={() => { setFreezeDialogOpen(false); setActiveView('review'); }} />
+        </div>
+      </Dialog>
 
       <footer className="app-footer">
         <span>所有实验数据仅保存在当前浏览器 localStorage。</span>
@@ -713,24 +932,6 @@ function App() {
       </footer>
     </div>
   );
-}
-
-function hasMissingSafety(step: ProcessStep): boolean {
-  return step.hazards.length > 0 && (!step.controls.trim() || !step.safetyNote.trim());
-}
-
-function collectDownstream(steps: ProcessStep[], sourceId: string | null): string[] {
-  if (!sourceId) return [];
-  const result = new Set<string>();
-  const visit = (id: string) => {
-    steps.filter((step) => step.dependencies.includes(id)).forEach((step) => {
-      if (result.has(step.id)) return;
-      result.add(step.id);
-      visit(step.id);
-    });
-  };
-  visit(sourceId);
-  return [...result];
 }
 
 function nextMinorVersion(value: string): string {
@@ -746,13 +947,29 @@ function compareVersions(process: ExperimentProcess, baseId: string, targetId: s
   const diffs: DiffItem[] = [];
   const targetMap = new Map(target.steps.map((step) => [step.id, step]));
   const baseMap = new Map(base.steps.map((step) => [step.id, step]));
+  const titleOf = (id: string): string => targetMap.get(id)?.title ?? baseMap.get(id)?.title ?? id;
+  // 依赖关系以两版并集为准，任一版本里挂在该步骤之后的都算受影响。
+  const impactOf = (sourceId: string): string[] =>
+    [...new Set([...collectDownstream(base.steps, sourceId), ...collectDownstream(target.steps, sourceId)])].map(titleOf);
   base.steps.forEach((step) => {
-    if (!targetMap.has(step.id)) diffs.push({ id: step.id, title: step.title, kind: 'removed', detail: '目标版本已删除该步骤。' });
+    if (!targetMap.has(step.id)) {
+      const impacted = impactOf(step.id);
+      diffs.push({
+        id: step.id, title: step.title, kind: 'removed',
+        detail: `目标版本已删除该步骤。${impacted.length ? `受影响下游步骤：${impacted.join('、')}。` : '无下游步骤受影响。'}`,
+        impactedBy: impacted
+      });
+    }
   });
   target.steps.forEach((step) => {
     const before = baseMap.get(step.id);
     if (!before) {
-      diffs.push({ id: step.id, title: step.title, kind: 'added', detail: `${step.duration} 分钟；危险项：${step.hazards.join('、') || '无'}` });
+      const impacted = impactOf(step.id);
+      diffs.push({
+        id: step.id, title: step.title, kind: 'added',
+        detail: `${step.duration} 分钟；危险项：${step.hazards.join('、') || '无'}。${impacted.length ? `受影响下游步骤：${impacted.join('、')}。` : ''}`,
+        impactedBy: impacted
+      });
       return;
     }
     const fields: string[] = [];
@@ -765,7 +982,14 @@ function compareVersions(process: ExperimentProcess, baseId: string, targetId: s
     if (before.controls !== step.controls || before.safetyNote !== step.safetyNote) fields.push('安全控制');
     if (JSON.stringify(before.dependencies) !== JSON.stringify(step.dependencies)) fields.push('依赖关系');
     if (before.expectedResult !== step.expectedResult) fields.push('预期结果');
-    if (fields.length) diffs.push({ id: step.id, title: step.title, kind: 'changed', detail: `变化字段：${fields.join('、')}。` });
+    if (fields.length) {
+      const impacted = impactOf(step.id);
+      diffs.push({
+        id: step.id, title: step.title, kind: 'changed',
+        detail: `变化字段：${fields.join('、')}。${impacted.length ? `受影响下游步骤：${impacted.join('、')}。` : '无下游步骤受影响。'}`,
+        impactedBy: impacted
+      });
+    }
   });
   return diffs;
 }
