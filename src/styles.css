@@ -151,6 +151,54 @@ button, input, textarea, select { font: inherit; }
 .freeze-rules > div strong { font-size: 10px; }
 .freeze-rules > div small { color: #8692a1; font-size: 9px; }
 .freeze-rules .bp6-button { margin-top: 14px; }
+/* 待复核批次 */
+.batch-stack { display: grid; gap: 10px; }
+.batch-entry { padding: 11px 12px; border: 1px solid #e2d9c3; border-radius: 8px; background: #fffdf7; }
+.batch-entry.done { border-color: #cfe3d4; background: #f7fcf9; }
+.batch-entry.compact { padding: 9px 10px; }
+.batch-entry > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.batch-entry > header small { color: #8a939f; font-size: 9px; }
+.batch-reason { margin: 7px 0 4px; font-size: 10px; line-height: 1.6; color: #5c5340; }
+.batch-fields { color: var(--amber); font-size: 9px; font-weight: 600; }
+.batch-entry.done .batch-fields { color: var(--green); }
+.batch-progress { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; margin: 8px 0 6px; }
+.batch-progress small { color: #7b8797; font-size: 9px; white-space: nowrap; }
+.batch-items { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.batch-items li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 6px; border-radius: 6px; }
+.batch-items li:nth-child(odd) { background: rgba(200,118,25,.06); }
+.batch-entry.done .batch-items li:nth-child(odd) { background: rgba(35,133,81,.06); }
+.batch-items li.confirmed { opacity: .75; }
+.batch-item-main { flex: 1; min-width: 0; display: flex; gap: 7px; align-items: flex-start; padding: 0; border: 0; text-align: left; background: transparent; cursor: pointer; }
+.batch-item-main strong, .batch-item-main small { display: block; }
+.batch-item-main strong { font-size: 10px; }
+.batch-item-main strong em { margin-left: 6px; padding: 1px 5px; border-radius: 4px; color: #fff; background: var(--amber); font-size: 8px; font-style: normal; }
+.batch-item-main small { margin-top: 2px; color: #838c98; font-size: 9px; line-height: 1.45; }
+.review-batch-card .batch-callout { margin: 0 0 12px; font-size: 10px; }
+.review-summary .batch-callout { margin-bottom: 12px; font-size: 10px; }
+.batch-history-list details { border-top: 1px solid #e7ebf0; }
+.batch-history-list summary { display: flex; align-items: center; gap: 9px; padding: 9px 2px; cursor: pointer; font-size: 10px; color: #526071; }
+.batch-history-list summary span { flex: 1; }
+.batch-history-list summary small { color: #8792a2; font-size: 9px; }
+.batch-history-list .batch-entry { margin: 4px 0 10px; }
+.status-tags { display: flex; gap: 6px; }
+/* 冻结拦截弹窗 */
+.freeze-overlay { display: grid; place-items: center; background: rgba(17,30,43,.55); }
+.freeze-dialog { width: min(560px, calc(100vw - 32px)); padding-bottom: 0; background: #fff; border-radius: 12px; box-shadow: 0 18px 50px rgba(10,22,34,.35); }
+.bp6-dialog-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 18px 12px; }
+.bp6-dialog-header h4 { margin: 0; display: flex; align-items: center; gap: 8px; font-size: 15px; }
+.bp6-dialog-body { padding: 0 18px 14px; }
+.freeze-callout { margin-bottom: 12px; }
+.blocker-list { display: grid; gap: 9px; margin: 0 0 12px; padding: 0; list-style: none; }
+.blocker-list li { padding: 10px 12px; border: 1px solid #f0cfcf; border-radius: 8px; background: #fdf6f6; }
+.blocker-list li > div { display: flex; gap: 8px; align-items: center; }
+.blocker-list strong { font-size: 11px; color: #8a2525; }
+.blocker-list p { margin: 5px 0 0 23px; font-size: 10px; line-height: 1.6; color: #7c5b5b; }
+.bp6-dialog-footer { padding: 0 0 16px; }
+/* 版本比较中的批次与影响标记 */
+.diff-batches { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 12px; font-size: 10px; color: #697687; }
+.diff-row.impacted { background: #fdf4e3; }
+.version-batch-note { display: flex !important; align-items: center; gap: 4px; margin-top: 5px; color: var(--amber) !important; }
+.freeze-hint { margin-top: 10px; }
 .app-footer { min-height: 42px; padding: 13px 22px; display: flex; justify-content: space-between; gap: 20px; color: #778496; background: #e9edf2; border-top: 1px solid #d8dee5; font-size: 9px; }
 @media (max-width: 1240px) {
   .process-banner { grid-template-columns: 1fr 1fr; }
